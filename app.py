@@ -1,266 +1,253 @@
 import asyncio
-import aiohttp
-import logging
+import dataclasses
 import json
+import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Dict, Any, List, Optional
-from datetime import datetime
+from typing import Dict, List, Optional
+import aiohttp
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("WebhookDispatcher")
 
-@dataclass
+@dataclass(frozen=True)
 class WebhookTask:
     url: str
-    payload: Dict[str, Any]
-    headers: Optional[Dict[str, str]] = None
-    max_retries: int = 5
-    initial_backoff: float = 1.0
-    backoff_multiplier: float = 2.0
-    max_backoff: float = 60.0
+    payload: dict
+    headers: dict = field(default_factory=dict)
+    max_retries: int = 3
+    base_delay: float = 1.0
+    max_delay: float = 60.0
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
     attempt: int = 0
-    task_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    created_at: float = field(default_factory=time.time)
+    next_attempt_at: float = field(default_factory=time.time)
+    ttl: float = 86400.0  # 24 hours TTL for DLQ persistence cleanup
 
 class DeadLetterQueue:
-    def __init__(self, storage_path: str = "dlq.json", max_age_seconds: float = 86400.0):
-        self._storage: List[WebhookTask] = []
+    def __init__(self, persistence_file: str = "dlq.json"):
+        self._dlq: List[WebhookTask] = []
         self._lock = asyncio.Lock()
-        self._storage_path = storage_path
-        self._max_age_seconds = max_age_seconds
+        self._persistence_file = persistence_file
+        self._load_from_file()
 
-    async def load(self):
-        async with self._lock:
-            try:
-                def _read_file():
-                    with open(self._storage_path, "r") as f:
-                        return json.load(f)
-                
-                data = await asyncio.to_thread(_read_file)
-                self._storage = [WebhookTask(**d) for d in data]
-                logger.info(f"Loaded {len(self._storage)} items from DLQ storage.")
-            except FileNotFoundError:
-                logger.info("No existing DLQ storage file found. Starting fresh.")
-            except Exception as e:
-                logger.error(f"Failed to load DLQ storage: {e}")
-
-    async def _save(self):
+    def _load_from_file(self):
+        if not os.path.exists(self._persistence_file):
+            return
         try:
-            def _write_file():
-                with open(self._storage_path, "w") as f:
-                    json.dump([task.__dict__ for task in self._storage], f)
-            
-            await asyncio.to_thread(_write_file)
+            with open(self._persistence_file, "r") as f:
+                data = json.load(f)
+                current_time = time.time()
+                loaded_tasks = []
+                for item in data:
+                    task = WebhookTask(**item)
+                    # Filter out tasks that have exceeded their TTL
+                    if current_time - task.next_attempt_at < task.ttl:
+                        loaded_tasks.append(task)
+                self._dlq = loaded_tasks
+                logger.info(f"Loaded {len(self._dlq)} tasks from DLQ storage.")
         except Exception as e:
-            logger.error(f"Failed to save DLQ storage: {e}")
+            logger.error(f"Failed to load DLQ from file: {e}")
+
+    def _save_to_file_unlocked(self):
+        try:
+            current_time = time.time()
+            # Clean expired tasks before saving
+            self._dlq = [task for task in self._dlq if current_time - task.next_attempt_at < task.ttl]
+            data = [dataclasses.asdict(task) for task in self._dlq]
+            with open(self._persistence_file, "w") as f:
+                json.dump(data, f)
+        except Exception as e:
+            logger.error(f"Failed to save DLQ to file: {e}")
 
     async def add(self, task: WebhookTask, reason: str):
         async with self._lock:
-            logger.error(f"Task {task.task_id} moved to DLQ. URL: {task.url}. Reason: {reason}")
-            self._storage.append(task)
-            await self._save()
+            logger.error(f"Task {task.id} moved to DLQ. Reason: {reason}. URL: {task.url}")
+            self._dlq.append(task)
+            self._save_to_file_unlocked()
 
     async def get_all(self) -> List[WebhookTask]:
         async with self._lock:
-            return list(self._storage)
-
-    async def cleanup(self):
-        async with self._lock:
-            now = time.time()
-            initial_count = len(self._storage)
-            self._storage = [
-                task for task in self._storage
-                if now - task.created_at < self._max_age_seconds
-            ]
-            if len(self._storage) < initial_count:
-                logger.info(f"Cleaned up {initial_count - len(self._storage)} expired tasks from DLQ.")
-                await self._save()
+            current_time = time.time()
+            self._dlq = [task for task in self._dlq if current_time - task.next_attempt_at < task.ttl]
+            return list(self._dlq)
 
 class WebhookDispatcher:
-    def __init__(self, concurrency_limit: int = 10, dlq_storage_path: str = "dlq.json"):
-        self.queue: asyncio.Queue[WebhookTask] = asyncio.Queue()
-        self.dlq = DeadLetterQueue(storage_path=dlq_storage_path)
-        self.concurrency_limit = concurrency_limit
+    def __init__(self, concurrency: int = 10, max_queue_size: int = 1000):
+        # Bounded PriorityQueue to prevent unbounded memory growth
+        self.queue: asyncio.PriorityQueue = asyncio.PriorityQueue(maxsize=max_queue_size)
+        self.dlq = DeadLetterQueue()
+        self.concurrency = concurrency
         self._workers: List[asyncio.Task] = []
         self._session: Optional[aiohttp.ClientSession] = None
         self._running = False
-        self._task_lock = asyncio.Lock()
 
     async def start(self):
         if self._running:
             return
         self._running = True
-        
-        await self.dlq.load()
-        
-        self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=10)
-        )
-        for i in range(self.concurrency_limit):
-            worker = asyncio.create_task(self._worker(f"Worker-{i}"))
-            self._workers.append(worker)
-        logger.info(f"WebhookDispatcher started with {self.concurrency_limit} workers.")
+        self._session = aiohttp.ClientSession()
+        self._workers = [
+            asyncio.create_task(self._worker(f"Worker-{i}"))
+            for i in range(self.concurrency)
+        ]
+        logger.info(f"WebhookDispatcher started with {self.concurrency} workers.")
 
     async def stop(self):
         if not self._running:
             return
         self._running = False
         
-        for _ in self._workers:
-            await self.queue.put(None) # Sentinel to wake up workers
+        for worker in self._workers:
+            worker.cancel()
+        
+        if self._workers:
+            await asyncio.gather(*self._workers, return_exceptions=True)
             
-        await asyncio.gather(*self._workers, return_exceptions=True)
-        self._workers.clear()
-
         if self._session:
             await self._session.close()
-            self._session = None
             
         logger.info("WebhookDispatcher stopped.")
 
-    async def dispatch(self, url: str, payload: Dict[str, Any], headers: Optional[Dict[str, str]] = None, **kwargs):
-        task = WebhookTask(url=url, payload=payload, headers=headers, **kwargs)
-        await self.queue.put(task)
-        logger.debug(f"Enqueued webhook task {task.task_id} for {url}")
+    async def dispatch(self, task: WebhookTask):
+        await self.queue.put((task.next_attempt_at, task))
+        logger.debug(f"Disqueued task {task.id} for {task.url}")
 
     async def _worker(self, name: str):
-        logger.debug(f"Dispatcher worker {name} started.")
+        logger.debug(f"{name} started.")
         while self._running:
-            task = await self.queue.get()
-            if task is None:
-                self.queue.task_done()
-                break
-
+            task = None
             try:
-                await self._process_task(task)
-            except Exception as e:
-                logger.exception(f"Unexpected error in worker {name} processing task {task.task_id}: {e}")
-            finally:
-                self.queue.task_done()
-        logger.debug(f"Dispatcher worker {name} stopped.")
+                try:
+                    next_attempt_at, task = await asyncio.wait_for(
+                        self.queue.get(), timeout=1.0
+                    )
+                except asyncio.TimeoutError:
+                    continue
 
-    async def _process_task(self, task: WebhookTask):
-        assert self._session is not None, "Session is not initialized"
-        
-        headers = {"Content-Type": "application/json"}
-        if task.headers:
-            headers.update(task.headers)
+                now = time.time()
+                if now < next_attempt_at:
+                    sleep_duration = next_attempt_at - now
+                    await asyncio.sleep(sleep_duration)
 
-        while task.attempt < task.max_retries:
-            async with self._task_lock:
-                task.attempt += 1
+                success = await self._send_request(task)
                 
-            try:
-                async with self._session.post(task.url, json=task.payload, headers=headers) as response:
-                    if 200 <= response.status < 300:
-                        logger.info(f"Successfully delivered webhook {task.task_id} to {task.url} on attempt {task.attempt}")
-                        return
+                if success:
+                    self.queue.task_done()
+                    logger.info(f"Task {task.id} successfully delivered to {task.url}")
+                else:
+                    new_attempt = task.attempt + 1
+                    if new_attempt > task.max_retries:
+                        self.queue.task_done()
+                        await self.dlq.add(task, f"Exceeded max retries ({task.max_retries})")
                     else:
-                        response_body = await response.text()
-                        logger.warning(
-                            f"Webhook {task.task_id} failed with status {response.status} "
-                            f"on attempt {task.attempt}/{task.max_retries}. Response: {response_body[:200]}"
+                        delay = min(task.base_delay * (2 ** (new_attempt - 1)), task.max_delay)
+                        next_time = time.time() + delay
+                        # Create an immutable new task object for retry to prevent shared state/race conditions
+                        new_task = dataclasses.replace(
+                            task,
+                            attempt=new_attempt,
+                            next_attempt_at=next_time
                         )
-                        if 400 <= response.status < 500 and response.status != 429:
-                            await self.dlq.add(task, f"Client error HTTP {response.status}")
-                            return
-            
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                logger.warning(
-                    f"Webhook {task.task_id} encountered network error '{str(e)}' "
-                    f"on attempt {task.attempt}/{task.max_retries}"
-                )
+                        logger.warning(
+                            f"Task {task.id} failed attempt {new_task.attempt}. "
+                            f"Retrying in {delay:.2f}s."
+                        )
+                        await self.queue.put((new_task.next_attempt_at, new_task))
+                        self.queue.task_done()
 
-            if task.attempt >= task.max_retries:
+            except asyncio.CancelledError:
+                if task is not None:
+                    try:
+                        self.queue.task_done()
+                    except ValueError:
+                        pass
                 break
+            except Exception as e:
+                if task is not None:
+                    try:
+                        self.queue.task_done()
+                    except ValueError:
+                        pass
+                logger.exception(f"{name} encountered an unexpected error: {e}")
 
-            backoff = min(
-                task.initial_backoff * (task.backoff_multiplier ** (task.attempt - 1)),
-                task.max_backoff
-            )
-            logger.info(f"Retrying webhook {task.task_id} in {backoff:.2f} seconds...")
-            await asyncio.sleep(backoff)
+    async def _send_request(self, task: WebhookTask) -> bool:
+        if not self._session:
+            return False
+        
+        default_headers = {"Content-Type": "application/json", "User-Agent": "WebhookDispatcher/1.0"}
+        headers = {**default_headers, **task.headers}
 
-        await self.dlq.add(task, f"Exhausted max retries ({task.max_retries})")
+        try:
+            async with self._session.post(
+                task.url, json=task.payload, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+            ) as response:
+                if 200 <= response.status < 300:
+                    return True
+                else:
+                    logger.warning(
+                        f"Task {task.id} received non-success status {response.status} from {task.url}"
+                    )
+                    return False
+        except asyncio.TimeoutError:
+            logger.warning(f"Task {task.id} timed out connecting to {task.url}")
+            return False
+        except aiohttp.ClientError as e:
+            logger.warning(f"Task {task.id} network error connecting to {task.url}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Task {task.id} unexpected error connecting to {task.url}: {e}")
+            return False
 
 async def main():
-    dispatcher = WebhookDispatcher(concurrency_limit=5)
+    dispatcher = WebhookDispatcher(concurrency=5)
     await dispatcher.start()
 
-    server = await asyncio.start_server(
-        handle_mock_webhook, '127.0.0.1', 8080
-    )
-    
-    server_task = asyncio.create_task(server.serve_forever())
+    server_runner = None
+    try:
+        try:
+            from aiohttp import web
+            async def handle(request):
+                data = await request.json()
+                if data.get("fail_count", 0) > 0:
+                    return web.Response(status=500, text="Internal Error")
+                return web.Response(status=200, text="OK")
 
-    target_url = "http://127.0.0.1:8080/webhook"
+            app = web.Application()
+            app.router.add_post("/webhook", handle)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, "127.0.0.1", 8080)
+            await site.start()
+            server_runner = runner
+        except Exception:
+            server_runner = None
 
-    logger.info("Dispatching test webhooks...")
-    
-    await dispatcher.dispatch(
-        url=target_url,
-        payload={"event": "user.created", "user_id": 42},
-        max_retries=3
-    )
-
-    await dispatcher.dispatch(
-        url="http://127.0.0.1:8080/fail",
-        payload={"event": "system.error"},
-        max_retries=2,
-        initial_backoff=0.1
-    )
-
-    await dispatcher.queue.join()
-    
-    await asyncio.sleep(1)
-
-    # Trigger periodic DLQ cleanup test
-    await dispatcher.dlq.cleanup()
-
-    dlq_items = await dispatcher.dlq.get_all()
-    logger.info(f"Items in DLQ: {len(dlq_items)}")
-    for item in dlq_items:
-        logger.info(f"DLQ Item -> ID: {item.task_id}, URL: {item.url}, Attempts: {item.attempt}")
-
-    server.close()
-    await server.wait_closed()
-    await server_task
-    await dispatcher.stop()
-
-async def handle_mock_webhook(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    request_line = await reader.readline()
-    if not request_line:
-        writer.close()
-        return
+        target_url = "http://127.0.0.1:8080/webhook"
         
-    method, path, _ = request_line.decode().split()
-    
-    headers = {}
-    while True:
-        line = await reader.readline()
-        if line == b'\r\n' or not line:
-            break
-        key, value = line.decode().split(':', 1)
-        headers[key.strip().lower()] = value.strip()
-        
-    content_length = int(headers.get('content-length', 0))
-    body = await reader.read(content_length)
-    
-    if path == "/webhook":
-        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
-    elif path == "/fail":
-        writer.write(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\n\r\nError")
-    else:
-        writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found")
-        
-    await writer.drain()
-    writer.close()
-    await writer.wait_closed()
+        task1 = WebhookTask(url=target_url, payload={"message": "hello world"}, max_retries=2, base_delay=0.1)
+        await dispatcher.dispatch(task1)
+
+        task2 = WebhookTask(url="http://127.0.0.1:8080/nonexistent", payload={"message": "will fail completely"}, max_retries=1, base_delay=0.1)
+        await dispatcher.dispatch(task2)
+
+        await asyncio.sleep(2.0)
+
+        dlq_items = await dispatcher.dlq.get_all()
+        logger.info(f"Total items in DLQ: {len(dlq_items)}")
+
+        if server_runner:
+            await server_runner.cleanup()
+
+    finally:
+        await dispatcher.stop()
+        # Clean up temporary persistence file after run if desired
+        if os.path.exists("dlq.json"):
+            try:
+                os.remove("dlq.json")
+            except OSError:
+                pass
 
 if __name__ == "__main__":
     asyncio.run(main())
